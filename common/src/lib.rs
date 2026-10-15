@@ -58,3 +58,8 @@ pub struct Globals {
     /// The explicit log level requested on the command line, if any.
     pub log_level: Option<String>,
 }
+
+/// Phase 0 push-range probe A.
+pub fn probe_push_a(x: u32) -> bool {
+    x > 3
+}

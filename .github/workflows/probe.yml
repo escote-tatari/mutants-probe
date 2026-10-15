@@ -76,7 +76,7 @@ jobs:
           SHA: ${{ github.sha }}
           TOKEN: ${{ github.token }}
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           echo "event=$EVENT sha=$SHA HEAD=$(git rev-parse HEAD)"
           git log --oneline -3 || true
           if [ "$EVENT" = push ]; then
