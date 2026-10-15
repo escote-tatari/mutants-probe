@@ -37,3 +37,8 @@ pub use scope::{
 /// a second env-touching module added later inherits the lock instead of minting its own.
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Phase 0 push-range probe B.
+pub fn probe_push_b(x: u32) -> u32 {
+    x * 2
+}
