@@ -1,0 +1,13 @@
+name: caller
+
+# Mirrors the design's caller: the caller grants the ceiling, the reusable narrows.
+on:
+  pull_request: {}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  comment:
+    uses: scottidler/mutants-probe/.github/workflows/comment.yml@main

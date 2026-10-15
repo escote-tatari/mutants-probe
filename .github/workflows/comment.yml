@@ -1,0 +1,70 @@
+name: comment-reusable
+
+# Reusable: workflow-level contents: read; only the upsert job adds pull-requests: write.
+on:
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+jobs:
+  readonly:
+    # Negative control: no pull-requests: write, so a POST must be refused.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: POST without pull-requests write
+        env:
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          code=$(curl -sS -o /tmp/resp.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/issues/$PR/comments" \
+            -d '{"body":"<!-- mutants-probe-readonly --> should never land"}')
+          echo "READONLY-POST-HTTP=$code"
+          jq -r .message /tmp/resp.json || true
+          echo "### readonly POST: HTTP $code" >> "$GITHUB_STEP_SUMMARY"
+
+  upsert:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: upsert sticky comment twice
+        env:
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          marker='<!-- mutants-on-prs -->'
+          api=https://api.github.com
+          hdr=(-H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json")
+          upsert() {
+            local body id code
+            body=$(printf '%s\nprobe pass %s, head %s, run %s\n' "$marker" "$1" "$HEAD_SHA" "$RUN_URL")
+            id=$(curl -fsS "${hdr[@]}" "$api/repos/$REPO/issues/$PR/comments?per_page=100" \
+              | jq -r --arg m "$marker" '[.[] | select(.body | startswith($m)) | .id][0] // empty')
+            if [ -z "$id" ]; then
+              code=$(curl -sS -o /tmp/resp.json -w '%{http_code}' -X POST "${hdr[@]}" \
+                "$api/repos/$REPO/issues/$PR/comments" -d "$(jq -n --arg b "$body" '{body:$b}')")
+              echo "UPSERT-$1 POST HTTP=$code id=$(jq -r .id /tmp/resp.json)"
+            else
+              code=$(curl -sS -o /tmp/resp.json -w '%{http_code}' -X PATCH "${hdr[@]}" \
+                "$api/repos/$REPO/issues/comments/$id" -d "$(jq -n --arg b "$body" '{body:$b}')")
+              echo "UPSERT-$1 PATCH HTTP=$code id=$id"
+            fi
+            echo "### upsert $1: HTTP $code" >> "$GITHUB_STEP_SUMMARY"
+            [ "$code" = 200 ] || [ "$code" = 201 ]
+          }
+          upsert 1
+          upsert 2
+          n=$(curl -fsS "${hdr[@]}" "$api/repos/$REPO/issues/$PR/comments?per_page=100" \
+            | jq --arg m "$marker" '[.[] | select(.body | startswith($m))] | length')
+          echo "MARKER-COMMENT-COUNT=$n"

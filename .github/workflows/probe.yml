@@ -1,0 +1,232 @@
+name: probe
+
+# Throwaway measurement workflow for tatari-tv/github-actions-public
+# docs/design/2026-10-14-mutants-on-prs.md, Phase 0. Not product code.
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      range:
+        description: "Diff range '<base> <head>' (dispatch only); empty = HEAD^1 HEAD"
+        required: false
+        type: string
+        default: ""
+      strategies:
+        description: "Run the build-strategy matrix"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  MUTANTS_VERSION: "27.1.0"
+  MUTANTS_SHA256: "dfe6dc37d0342c891d2829b5a695aa57c2d0edecef7e7d0399a30cc6e206411e"
+  RUST_VERSION: "1.96.0"
+  CARGO_TERM_COLOR: never
+
+jobs:
+  env:
+    runs-on: ubuntu-latest
+    steps:
+      - name: runner shape
+        run: |
+          echo "private=${{ github.event.repository.private }}"
+          echo "nproc=$(nproc)"
+          free -m
+          df -h
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core'
+          echo "TMPDIR=${TMPDIR:-unset} RUNNER_TEMP=$RUNNER_TEMP"
+          findmnt -T /tmp
+          findmnt -T "$RUNNER_TEMP"
+          {
+            echo "### runner shape"
+            echo '```'
+            echo "private=${{ github.event.repository.private }} nproc=$(nproc)"
+            free -m
+            df -h / /mnt 2>/dev/null
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: install cargo-mutants
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/sourcefrog/cargo-mutants/releases/download/v${MUTANTS_VERSION}/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz" -o /tmp/cm.tgz
+          echo "${MUTANTS_SHA256}  /tmp/cm.tgz" | sha256sum -c -
+          tar -xzf /tmp/cm.tgz -C "$HOME/.cargo/bin" cargo-mutants
+          cargo mutants --version
+      - name: derive diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+          TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          echo "event=$EVENT sha=$SHA HEAD=$(git rev-parse HEAD)"
+          git log --oneline -3 || true
+          if [ "$EVENT" = push ]; then
+            echo "before=$BEFORE"
+            echo "--- fetch before, anonymous (persist-credentials: false)"
+            git fetch --depth=1 origin "$BEFORE"; echo "anon-fetch-rc=$?"
+            if ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+              echo "--- fetch before, with job token as extraheader"
+              auth=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)
+              git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" fetch --depth=1 origin "$BEFORE"; echo "auth-fetch-rc=$?"
+            fi
+            git diff "$BEFORE" "$SHA" > pr.diff; echo "diff-rc=$?"
+            echo "--- commits in before..sha"
+            git log --oneline "$BEFORE..$SHA"
+          else
+            git diff HEAD^1 HEAD > pr.diff; echo "diff-rc=$?"
+          fi
+          echo "--- files in diff"
+          grep '^+++ ' pr.diff
+          wc -l pr.diff
+          cargo mutants --list --in-diff pr.diff --workspace > list.txt
+          rc=$?
+          echo "LIST-RC=$rc"
+          echo "count=$(wc -l < list.txt)"
+          cat list.txt
+          json=$(cargo mutants --list --json --in-diff pr.diff --workspace); jrc=$?
+          echo "LIST-JSON-RC=$jrc bytes=${#json} jq-length=$(printf '%s' "$json" | jq length)"
+          {
+            echo "### diff derivation ($EVENT)"
+            echo "list rc=$rc count=$(wc -l < list.txt)"
+            echo '```'
+            grep '^+++ ' pr.diff
+            cat list.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  strategy:
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.strategies)
+    name: strategy ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: inplace-j1, flags: "--in-place --jobs 1", jobs: 1 }
+          - { name: copytarget-j2, flags: "--copy-target true --jobs 2", jobs: 2 }
+          - { name: copy-j2, flags: "--jobs 2", jobs: 2 }
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: install cargo-mutants
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/sourcefrog/cargo-mutants/releases/download/v${MUTANTS_VERSION}/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz" -o /tmp/cm.tgz
+          echo "${MUTANTS_SHA256}  /tmp/cm.tgz" | sha256sum -c -
+          tar -xzf /tmp/cm.tgz -C "$HOME/.cargo/bin" cargo-mutants
+      - name: diff
+        env:
+          RANGE: ${{ inputs.range }}
+        run: |
+          if [ -n "${RANGE:-}" ]; then git diff $RANGE > "$RUNNER_TEMP/pr.diff"; else git diff HEAD^1 HEAD > "$RUNNER_TEMP/pr.diff"; fi
+          cargo mutants --list --in-diff "$RUNNER_TEMP/pr.diff" --workspace | wc -l
+      - name: start disk/mem sampler
+        run: |
+          echo "df-before-used-MB=$(df -B1M --output=used / | tail -1 | tr -d ' ') avail-MB=$(df -B1M --output=avail / | tail -1 | tr -d ' ')" | tee "$RUNNER_TEMP/df0"
+          nohup bash -c 'while true; do echo "$(date +%s) $(df -B1M --output=used / | tail -1 | tr -d " ") $(free -m | awk "/Mem:/{print \$3}")"; sleep 2; done' > "$RUNNER_TEMP/samples.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/sampler.pid"
+      - name: prebuild (stands in for a warm rust-cache)
+        run: |
+          /usr/bin/time -f "PREBUILD wall=%es maxrss=%MKB" cargo test --workspace --no-run 2>&1 | tail -2
+          du -sh target
+      - name: cargo mutants
+        env:
+          FLAGS: ${{ matrix.flags }}
+          JOBS: ${{ matrix.jobs }}
+        run: |
+          set +e
+          cores=$(nproc)
+          export RAYON_NUM_THREADS=$(( cores / JOBS > 0 ? cores / JOBS : 1 ))
+          echo "RAYON_NUM_THREADS=$RAYON_NUM_THREADS"
+          /usr/bin/time -f "MUTANTS wall=%es maxrss=%MKB" cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" --workspace -t 300 $FLAGS --output "$RUNNER_TEMP" 2>&1 | tee "$RUNNER_TEMP/mutants.log"
+          echo "rc=${PIPESTATUS[0]}" | tee "$RUNNER_TEMP/rc"
+      - name: report
+        if: always()
+        env:
+          NAME: ${{ matrix.name }}
+        run: |
+          kill "$(cat "$RUNNER_TEMP/sampler.pid")" || true
+          o="$RUNNER_TEMP/mutants.out/outcomes.json"
+          used0=$(sed -E 's/.*used-MB=([0-9]+).*/\1/' "$RUNNER_TEMP/df0")
+          peak=$(awk 'BEGIN{m=0} {if ($2>m) m=$2} END{print m}' "$RUNNER_TEMP/samples.log")
+          peakmem=$(awk 'BEGIN{m=0} {if ($3>m) m=$3} END{print m}' "$RUNNER_TEMP/samples.log")
+          {
+            echo "### strategy $NAME"
+            echo '```'
+            echo "nproc=$(nproc) $(cat "$RUNNER_TEMP/rc")"
+            grep -E 'PREBUILD|MUTANTS wall|mutants tested|Unmutated baseline' "$RUNNER_TEMP/mutants.log" || true
+            echo "disk used before=${used0}MB peak=${peak}MB delta=$((peak-used0))MB"
+            echo "mem used peak=${peakmem}MB"
+            echo "--- baseline phases"
+            jq -r '.outcomes[] | select(.scenario=="Baseline") | .phase_results[] | "\(.phase) \(.duration)"' "$o"
+            echo "--- per-mutant mean seconds (build+test) by outcome"
+            jq -r '.outcomes[] | select(.scenario!="Baseline") | [.summary, ([.phase_results[].duration]|add)] | @tsv' "$o" \
+              | awk '{s[$1]+=$2; n[$1]++; t+=$2; c++} END{for(k in s) printf "%s n=%d mean=%.2fs\n",k,n[k],s[k]/n[k]; printf "ALL n=%d mean=%.2fs sum=%.1fs\n",c,t/c,t}'
+            echo "--- missed"
+            cat "$RUNNER_TEMP/mutants.out/missed.txt"
+            echo "--- timeout"
+            cat "$RUNNER_TEMP/mutants.out/timeout.txt"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: strategy-${{ matrix.name }}
+          path: |
+            ${{ runner.temp }}/mutants.out
+            ${{ runner.temp }}/samples.log
+            ${{ runner.temp }}/mutants.log
+
+  cache:
+    if: github.event_name == 'pull_request'
+    name: cache shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: rust-cache
+        id: cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: mutants-probe
+          save-if: ${{ matrix.shard == 0 }}
+      - name: build
+        run: |
+          echo "CACHE-HIT=${{ steps.cache.outputs.cache-hit }} shard=${{ matrix.shard }} attempt=${{ github.run_attempt }}"
+          du -sh target 2>/dev/null || echo "no target"
+          /usr/bin/time -f "BUILD wall=%es" cargo test --workspace --no-run 2>&1 | tail -1
+          du -sh target
+          echo "### cache shard ${{ matrix.shard }} attempt ${{ github.run_attempt }}: hit=${{ steps.cache.outputs.cache-hit }}" >> "$GITHUB_STEP_SUMMARY"
